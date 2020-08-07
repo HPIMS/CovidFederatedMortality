@@ -48,7 +48,6 @@ class LASSO(nn.Module):
         return out
 
 
-# GPU execution takes a lot longer for this. Not sure why.
 # Federation has to be repeated for each fold of data
 class Federated:
     def __init__(self, split_training_datasets, split_testing_datasets, model_type, noise):
