@@ -7,7 +7,7 @@ import numpy as np
 
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split
 
 from config import Config
 
@@ -53,7 +53,9 @@ class DataSplitter:
 
 
 class StratifiedDatasetCreator:
-    def __init__(self):
+    def __init__(self, seed):
+        self.random_state = seed
+
         self.df_mortality = pd.read_pickle(
             os.path.join(Config.data_dir, 'MORTALITY_7.pickle'))
 
@@ -65,24 +67,21 @@ class StratifiedDatasetCreator:
         self.testing_datasets = {}
 
     def retching_maw(self):
-        # Init the skf validator
-        skf = StratifiedKFold(
-            n_splits=Config.cross_val_folds,
-            shuffle=True,
-            random_state=Config.random_state)
-
         for facility, df_facility in self.datasets_by_facility.items():
+            X = df_facility.drop('MORTALITY', axis=1)
             y = df_facility[['MORTALITY']]
-            zero_array = np.zeros(y.shape[0])
 
             # Store dataframes as iterables
             self.training_datasets[facility] = []
             self.testing_datasets[facility] = []
 
             # Splitter
-            for (train, test) in skf.split(zero_array, y):
-                testing_data = df_facility.iloc[test]
-                training_data = df_facility.iloc[train]
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.3, stratify=y,
+                random_state=self.random_state)
 
-                self.training_datasets[facility].append(training_data)
-                self.testing_datasets[facility].append(testing_data)
+            training_data = pd.concat((X_train, y_train), axis=1)
+            testing_data = pd.concat((X_test, y_test), axis=1)
+
+            self.training_datasets[facility].append(training_data)
+            self.testing_datasets[facility].append(testing_data)
