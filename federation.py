@@ -15,9 +15,7 @@ from sklearn.metrics import\
     precision_recall_curve, roc_curve, auc, roc_auc_score,\
     accuracy_score, f1_score, confusion_matrix
 
-from config import Config
-
-torch.manual_seed(Config.random_state)
+from config import Config, Bootstrap
 
 
 class MLP(nn.Module):
@@ -48,11 +46,16 @@ class LASSO(nn.Module):
         return out
 
 
+# GPU execution takes a lot longer for this. Not sure why.
 # Federation has to be repeated for each fold of data
 class Federated:
-    def __init__(self, split_training_datasets, split_testing_datasets, model_type, noise):
+    def __init__(self, split_training_datasets, split_testing_datasets, seed, model_type, noise):
         # Store metrics here
         self.dict_metrics = {}
+        self.device = torch.device('cpu')
+
+        self.seed = seed
+        torch.manual_seed(self.seed)
 
         # This is the type of the model. It's either an MLP or a LASSO
         # ALL CAPS
@@ -62,13 +65,11 @@ class Federated:
 
         # Notifications
         self.noise = noise
-        if self.noise:
-            print('Adding noise to training')
 
         # Load datasets
         self.hospitals = list(split_training_datasets.keys())
-        for split in range(Config.cross_val_folds):
-            print('Current fold:', split)
+        for split in range(1):
+            # print('Current fold:', split)
             self.current_split = split
 
             self.dict_metrics_split = {}
@@ -96,7 +97,7 @@ class Federated:
                 # Create float tensors for each hospital
                 self.training_datasets_dataloaders[facility] = torch.utils.data.DataLoader(
                     df_train_hosp.values.astype('float32'),
-                    batch_size=64, shuffle=True, num_workers=8)
+                    batch_size=512, shuffle=True, num_workers=8)
 
                 self.training_datasets[facility] = df_train_hosp
                 self.testing_datasets[facility] = split_testing_datasets[facility][split]
@@ -110,12 +111,6 @@ class Federated:
             # Record metrics
             self.dict_metrics[split] = copy.deepcopy(self.dict_metrics_split)
 
-        # Save final metrics
-        pd.to_pickle(
-            self.dict_metrics,
-            f'{Config.metrics_save_dir}/Federated{self.model_type}TrainingMetrics_Noise{self.noise}.pickle',
-            protocol=4)
-
     def gaussian_noise(self, model_params):
         return_dict = {}
 
@@ -123,7 +118,7 @@ class Federated:
             # Mean:0, SD: 1
             noise_tensor = torch.randn(
                 tensor.shape,
-                dtype=tensor.dtype)
+                dtype=tensor.dtype).to(self.device)
             noise_tensor *= Config.gaussian_noise_scale
 
             return_dict[param] = tensor + noise_tensor
@@ -163,15 +158,14 @@ class Federated:
 
     def test_global_model(self, model, epoch):
         model.eval()
-        test_results = []
 
         # NOTE
         # This is a continuous evaluation on each facility's TRAINING dataset
         for facility, df_test in self.training_datasets.items():
             X_test = torch.Tensor(
-                df_test.drop('MORTALITY', axis=1).values.astype('float32'))
+                df_test.drop('MORTALITY', axis=1).values.astype('float32')).to(self.device)
             y_test = torch.Tensor(
-                df_test[['MORTALITY']].values.astype('float32'))
+                df_test[['MORTALITY']].values.astype('float32')).to(self.device)
 
             with torch.no_grad():
                 y_pred = model(X_test)
@@ -187,23 +181,15 @@ class Federated:
                 loss = torch.nn.functional.binary_cross_entropy(
                     y_pred, y_test)
 
-            fpr, tpr, _ = roc_curve(y_test, y_pred)
-            precision, recall, _ = precision_recall_curve(y_test, y_pred)
+            fpr, tpr, _ = roc_curve(y_test.cpu(), y_pred.cpu())
+            precision, recall, _ = precision_recall_curve(y_test.cpu(), y_pred.cpu())
             auprc = auc(recall, precision)
             auroc = auc(fpr, tpr)
 
             # # Record results
-            self.dict_metrics_split[facility]['loss'].append(loss.item())
+            self.dict_metrics_split[facility]['loss'].append(loss.cpu().item())
             self.dict_metrics_split[facility]['auroc'].append(auroc)
             self.dict_metrics_split[facility]['auprc'].append(auprc)
-
-            test_results.append((facility, loss.item(), auroc, auprc))
-
-        if epoch == Config.n_epochs - 1:
-            df_test_results = pd.DataFrame(
-                test_results,
-                columns=['FACILITY', 'BCE LOSS', 'AUROC', 'AUPRC'])
-            print(df_test_results.sort_values('FACILITY').reset_index(drop=True))
 
     def gaping_maw(self):
         if self.model_type == 'MLP':
@@ -211,8 +197,10 @@ class Federated:
         elif self.model_type == 'LASSO':
             global_model = LASSO(self.input_shape)
 
+        global_model.to(self.device)
+
         # Repeat training for each epoch for each hospital
-        for epoch in tqdm(range(Config.n_epochs)):
+        for epoch in range(Config.n_epochs):
             # Get global model weights
             # Will be the init weights for all local models
             global_params = global_model.state_dict()
@@ -226,6 +214,7 @@ class Federated:
                 if self.model_type == 'MLP':
                     local_model = MLP(self.input_shape)
                     local_model.load_state_dict(global_params)
+                    local_model.to(self.device)
 
                     # Train this model
                     criterion = torch.nn.NLLLoss()
@@ -234,6 +223,7 @@ class Federated:
                 elif self.model_type == 'LASSO':
                     local_model = LASSO(self.input_shape)
                     local_model.load_state_dict(global_params)
+                    local_model.to(self.device)
 
                     # Train this model
                     criterion = torch.nn.MSELoss(reduction='sum')
@@ -241,8 +231,8 @@ class Federated:
 
                 # Each hospital is trained once only within a global epoch
                 for train_data in self.training_datasets_dataloaders[client]:
-                    x_train = train_data[:, :-1]
-                    y_train = train_data[:, -1]
+                    x_train = train_data[:, :-1].to(self.device)
+                    y_train = train_data[:, -1].to(self.device)
 
                     pred = local_model(x_train)
 
@@ -292,14 +282,20 @@ class Federated:
         state_dict = global_model.state_dict()
         torch.save(state_dict, save_path)
 
+        pd.to_pickle(
+            self.dict_metrics_split,
+            f'{Bootstrap.bootstrap_iter_dir}/ModelEvolution/{self.model_type}_Noise_{self.noise}_seed_{self.seed}.pickle', protocol=4)
 
-def global_pooling(training_datasets, testing_datasets):
+
+def global_pooling(training_datasets, testing_datasets, seed):
+    torch.manual_seed(seed)
+
     facilities = list(training_datasets.keys())
     cols = training_datasets['MSH'][0].columns
 
     # Iterate through each split
-    for split in range(Config.cross_val_folds):
-        print('Current fold:', split)
+    for split in range(1):
+        # print('Current fold:', split)
 
         df_train = pd.DataFrame()
         df_test = pd.DataFrame()
@@ -315,9 +311,6 @@ def global_pooling(training_datasets, testing_datasets):
         if df_train.columns[-1] != 'MORTALITY':
             print('Nope.')
             exit(1)
-
-        print('Total patients:', len(df_train))
-        print('Outcomes:', len(df_train.query('MORTALITY == 1')))
 
         # Create datasets
         # Training gets a dataloder
@@ -336,7 +329,7 @@ def global_pooling(training_datasets, testing_datasets):
         criterion = torch.nn.NLLLoss()
         optim = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        for _ in tqdm(range(Config.n_epochs)):
+        for _ in range(Config.n_epochs):
             model.train()
             for training_data in training_dataloader:
                 # Get data
@@ -366,7 +359,7 @@ def global_pooling(training_datasets, testing_datasets):
         criterion = torch.nn.MSELoss(reduction='sum')
         optim = torch.optim.SGD(lso.parameters(), lr=0.001)
 
-        for _ in tqdm(range(Config.n_epochs)):
+        for _ in range(Config.n_epochs):
             lso.train()
             for training_data in training_dataloader:
                 # Get data
@@ -394,7 +387,9 @@ def global_pooling(training_datasets, testing_datasets):
         torch.save(lso.state_dict(), f'{Config.model_save_dir}/LASSO_Pooled_{split}.pth')
 
 
-def model_comparisons(training_datasets, testing_datasets):
+def model_comparisons(training_datasets, testing_datasets, seed):
+    torch.manual_seed(seed)
+
     # Also does comparisons against the saved global models
     # and local LASSO
     hospitals = list(training_datasets.keys())
@@ -402,13 +397,9 @@ def model_comparisons(training_datasets, testing_datasets):
     all_results = []
     dict_metrics = {}
 
-    for split in range(Config.cross_val_folds):
-        print('Current fold:', split)
-        dict_metrics[split] = {}
+    for split in range(1):
 
         for facility in hospitals:
-            print('Facility:', facility)
-
             # Training and testing data
             df_train = training_datasets[facility][split]
             train_loader = torch.utils.data.DataLoader(
@@ -437,7 +428,7 @@ def model_comparisons(training_datasets, testing_datasets):
             optim = torch.optim.Adam(model.parameters(), lr=0.001)
 
             # Training - LOCAL MLP ___
-            for _ in tqdm(range(Config.n_epochs)):
+            for _ in range(Config.n_epochs):
                 model.train()
                 for train_data in train_loader:
                     x_train = train_data[:, :-1]
@@ -457,7 +448,7 @@ def model_comparisons(training_datasets, testing_datasets):
             criterion = torch.nn.MSELoss(reduction='sum')
             optim = torch.optim.SGD(lso.parameters(), lr=0.001)
 
-            for _ in tqdm(range(Config.n_epochs)):
+            for _ in range(Config.n_epochs):
                 lso.train()
                 for train_data in train_loader:
                     # Get data
@@ -487,7 +478,7 @@ def model_comparisons(training_datasets, testing_datasets):
                 mlp_pred = model(x_test)
 
             # Eval metrics on CPU
-            # There's an .exp() here since the auroc / auprc are calculated on the probabilities
+            # There's a .exp() here since the auroc / auprc are calculated on the probabilities
             # NLL loss is calculated on Log Softmax output
             mlp_pred = mlp_pred.exp().cpu().numpy()[:, 1]
 
@@ -544,18 +535,18 @@ def model_comparisons(training_datasets, testing_datasets):
             # Put all predictions together
             pred_dict = {
                 'MLP: Local': mlp_pred,
-                'MLP: Federated (no Gaussian noise)': global_pred,
-                'MLP: Federated (with Gaussian noise)': global_pred_noisy,
+                'MLP: Federated (No noise)': global_pred,
+                'MLP: Federated (With noise)': global_pred_noisy,
                 'MLP: Global (Pooled data)': global_pred_pooled,
+                'LASSO: Local': lso_pred,
                 'LASSO: Federated': global_lso_pred,
-                'LASSO: Global (Pooled data)': lso_pooled_pred,
-                'LASSO: Local': lso_pred
+                'LASSO: Global (Pooled data)': lso_pooled_pred
             }
 
             # Store results
-            dict_metrics[split][facility] = {}
+            dict_metrics[facility] = {}
             for desc in pred_dict:
-                dict_metrics[split][facility][desc] = {}
+                dict_metrics[facility][desc] = {}
 
             for model_desc, predictions in pred_dict.items():
                 fpr, tpr, thresholds = roc_curve(y_test, predictions)
@@ -568,7 +559,8 @@ def model_comparisons(training_datasets, testing_datasets):
 
                 accuracy, sens, spec, f1s = metrics_calculator(y_test, predictions_binary)
 
-                dict_level = dict_metrics[split][facility][model_desc]
+                # Helpful shortcut to prevent verbosity
+                dict_level = dict_metrics[facility][model_desc]
 
                 dict_level['auroc'] = auroc
                 dict_level['auprc'] = auprc
@@ -578,31 +570,29 @@ def model_comparisons(training_datasets, testing_datasets):
                 dict_level['sens'] = sens
                 dict_level['spec'] = spec
                 dict_level['f1s'] = f1s
+                dict_level['truth_labels'] = y_test
+                dict_level['probability_est'] = predictions
 
                 # AUROC and AUPRC in the final iteration
                 all_results.append((
                     split, facility, model_desc, auroc, auprc, accuracy, sens, spec, f1s))
 
+    # Save results - Should contain everything
+    pd.to_pickle(
+        dict_metrics,
+        f'{Bootstrap.bootstrap_iter_dir}/ModelComparisons/seed_{seed}.pickle',
+        protocol=4)
+
     # Tabulate results
     columns = [
         'SPLIT', 'FACILITY', 'MODEL', 'AUROC', 'AUPRC',
         'ACC', 'SENS', 'SPEC', 'F1S']
-    df_results = pd.DataFrame(all_results, columns=columns).round(3)
+    df_results = pd.DataFrame(all_results, columns=columns)
     df_results = df_results.sort_values('FACILITY').reset_index(drop=True)
     df_results = df_results.set_index(['FACILITY', 'MODEL']).sort_index()
-    df_results.to_excel('ModelPerformanceComparisonsALL.xlsx')
-
-    df_results = df_results.reset_index().\
-        groupby(['FACILITY', 'MODEL']).apply(mean_ci_calculator)
-    df_results = pd.DataFrame.from_records(
-        df_results, index=df_results.index,
-        columns=['AUROC', 'AUPRC', 'ACC', 'SENS', 'SPEC', 'F1S'])
-
-    df_results.to_excel('ResultsWithCI.xlsx')
-    pd.to_pickle(dict_metrics, 'PerformanceCurves.pickle', protocol=4)
-
-    print(df_results)
-    breakpoint()
+    df_results.to_pickle(
+        f'{Bootstrap.bootstrap_iter_dir}/ModelComparisonsTabulated/seed_{seed}.pickle',
+        protocol=4)
 
 
 def mean_ci_calculator(df):
